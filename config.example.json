@@ -7,5 +7,11 @@
   "alert_on_first_scan": true,
   "alert_on_price_drop": true,
   "price_drop_percent": 10,
+  "ai_enabled": false,
+  "ai_model": "gpt-5-mini",
+  "ai_min_score": 75,
+  "ai_max_listings_per_scan": 5,
+  "ai_candidate_min_rule_score": 25,
+  "ai_use_images": true,
   "searches": []
 }
