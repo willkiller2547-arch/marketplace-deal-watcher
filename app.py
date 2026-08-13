@@ -7,6 +7,7 @@ from tkinter import messagebox, ttk
 
 import requests
 
+import ai_analyzer
 import watcher
 
 
@@ -55,11 +56,11 @@ class SearchDialog(tk.Toplevel):
         row += 1
 
         row = self.add_entry(frame, row, "Minimum discount %", "min_discount")
-        row = self.add_entry(frame, row, "Minimum deal score (0-100)", "min_score")
+        row = self.add_entry(frame, row, "Minimum rule score (0-100)", "min_score")
 
         hint = (
-            "Tip: make each Marketplace search fairly specific. "
-            "Automatic pricing works best when the results are similar products."
+            "Tip: make each Marketplace search fairly specific. The automatic baseline and AI "
+            "work best when the results are similar products."
         )
         ttk.Label(frame, text=hint, wraplength=650).grid(
             row=row, column=0, columnspan=2, sticky="w", pady=(8, 10)
@@ -101,7 +102,6 @@ class SearchDialog(tk.Toplevel):
         try:
             name = self.vars["name"].get().strip()
             url = self.vars["url"].get().strip()
-
             if not name:
                 raise ValueError("Give the search a name.")
             if "facebook.com/marketplace" not in url.lower():
@@ -110,7 +110,7 @@ class SearchDialog(tk.Toplevel):
             min_discount = max(0, float(self.vars["min_discount"].get().strip() or "0"))
             min_score = int(self.vars["min_score"].get().strip() or "55")
             if not 0 <= min_score <= 100:
-                raise ValueError("Minimum deal score must be between 0 and 100.")
+                raise ValueError("Minimum rule score must be between 0 and 100.")
 
             self.result = {
                 "name": name,
@@ -128,16 +128,15 @@ class SearchDialog(tk.Toplevel):
         except ValueError as exc:
             messagebox.showerror("Invalid search", str(exc), parent=self)
             return
-
         self.destroy()
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Marketplace Deal Watcher v2")
-        self.geometry("980x720")
-        self.minsize(860, 620)
+        self.title("Marketplace Deal Watcher v3")
+        self.geometry("1000x840")
+        self.minsize(900, 720)
 
         self.cfg = watcher.load_config()
         self.log_queue = queue.Queue()
@@ -150,8 +149,17 @@ class App(tk.Tk):
         self.first_scan_var = tk.BooleanVar(value=bool(self.cfg.get("alert_on_first_scan", True)))
         self.price_drop_var = tk.BooleanVar(value=bool(self.cfg.get("alert_on_price_drop", True)))
 
+        self.ai_enabled_var = tk.BooleanVar(value=bool(self.cfg.get("ai_enabled", False)))
+        self.ai_model_var = tk.StringVar(value=str(self.cfg.get("ai_model", "gpt-5-mini")))
+        self.ai_score_var = tk.StringVar(value=str(self.cfg.get("ai_min_score", 75)))
+        self.ai_limit_var = tk.StringVar(value=str(self.cfg.get("ai_max_listings_per_scan", 5)))
+        self.ai_use_images_var = tk.BooleanVar(value=bool(self.cfg.get("ai_use_images", True)))
+        self.ai_key_var = tk.StringVar()
+        self.ai_status_var = tk.StringVar()
+
         self.build_ui()
         self.refresh_searches()
+        self.refresh_ai_status()
         self.after(150, self.drain_logs)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -161,11 +169,7 @@ class App(tk.Tk):
 
         title_row = ttk.Frame(outer)
         title_row.pack(fill="x")
-        ttk.Label(
-            title_row,
-            text="Marketplace Deal Watcher v2",
-            font=("Segoe UI", 16, "bold"),
-        ).pack(side="left")
+        ttk.Label(title_row, text="Marketplace Deal Watcher v3", font=("Segoe UI", 16, "bold")).pack(side="left")
         ttk.Button(title_row, text="Facebook Login", command=self.facebook_login).pack(side="right")
 
         settings = ttk.LabelFrame(outer, text="Notifications & Watcher", padding=10)
@@ -173,53 +177,68 @@ class App(tk.Tk):
         settings.columnconfigure(1, weight=1)
 
         ttk.Label(settings, text="Discord webhook").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        webhook_entry = ttk.Entry(settings, textvariable=self.webhook_var, show="•")
-        webhook_entry.grid(row=0, column=1, sticky="ew")
-        ttk.Button(settings, text="Test Discord", command=self.test_discord).grid(
-            row=0, column=2, padx=(8, 0)
-        )
+        ttk.Entry(settings, textvariable=self.webhook_var, show="•").grid(row=0, column=1, sticky="ew")
+        ttk.Button(settings, text="Test Discord", command=self.test_discord).grid(row=0, column=2, padx=(8, 0))
 
         ttk.Label(settings, text="Check every").grid(row=1, column=0, sticky="w", pady=(10, 0))
         interval_frame = ttk.Frame(settings)
         interval_frame.grid(row=1, column=1, sticky="w", pady=(10, 0))
-        ttk.Spinbox(
-            interval_frame,
-            from_=15,
-            to=1440,
-            width=7,
-            textvariable=self.interval_var,
-        ).pack(side="left")
+        ttk.Spinbox(interval_frame, from_=15, to=1440, width=7, textvariable=self.interval_var).pack(side="left")
         ttk.Label(interval_frame, text=" minutes (minimum 15)").pack(side="left", padx=(6, 0))
 
         options = ttk.Frame(settings)
         options.grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        ttk.Checkbutton(
-            options, text="Run browser hidden", variable=self.headless_var
-        ).pack(side="left")
-        ttk.Checkbutton(
-            options, text="Alert on first scan", variable=self.first_scan_var
-        ).pack(side="left", padx=(16, 0))
-        ttk.Checkbutton(
-            options, text="Alert when a listing price drops", variable=self.price_drop_var
-        ).pack(side="left", padx=(16, 0))
+        ttk.Checkbutton(options, text="Run browser hidden", variable=self.headless_var).pack(side="left")
+        ttk.Checkbutton(options, text="Alert on first scan", variable=self.first_scan_var).pack(side="left", padx=(16, 0))
+        ttk.Checkbutton(options, text="Alert when a listing price drops", variable=self.price_drop_var).pack(side="left", padx=(16, 0))
+
+        ai_frame = ttk.LabelFrame(outer, text="AI Deal Analysis (OpenAI API)", padding=10)
+        ai_frame.pack(fill="x", pady=8)
+        ai_frame.columnconfigure(1, weight=1)
+
+        ttk.Checkbutton(ai_frame, text="Enable AI analysis", variable=self.ai_enabled_var).grid(row=0, column=0, sticky="w")
+        ttk.Label(ai_frame, textvariable=self.ai_status_var).grid(row=0, column=1, sticky="w", padx=(14, 0))
+
+        ttk.Label(ai_frame, text="API key").grid(row=1, column=0, sticky="w", pady=(9, 0))
+        ttk.Entry(ai_frame, textvariable=self.ai_key_var, show="•").grid(row=1, column=1, sticky="ew", pady=(9, 0))
+        key_buttons = ttk.Frame(ai_frame)
+        key_buttons.grid(row=1, column=2, sticky="e", padx=(8, 0), pady=(9, 0))
+        ttk.Button(key_buttons, text="Save Key", command=self.save_ai_key).pack(side="left")
+        ttk.Button(key_buttons, text="Test AI", command=self.test_ai).pack(side="left", padx=(6, 0))
+        ttk.Button(key_buttons, text="Clear", command=self.clear_ai_key).pack(side="left", padx=(6, 0))
+
+        ai_opts = ttk.Frame(ai_frame)
+        ai_opts.grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Label(ai_opts, text="Model").pack(side="left")
+        ttk.Entry(ai_opts, textvariable=self.ai_model_var, width=16).pack(side="left", padx=(6, 16))
+        ttk.Label(ai_opts, text="Notify if AI score ≥").pack(side="left")
+        ttk.Spinbox(ai_opts, from_=0, to=100, width=5, textvariable=self.ai_score_var).pack(side="left", padx=(6, 16))
+        ttk.Label(ai_opts, text="AI checks / scan").pack(side="left")
+        ttk.Spinbox(ai_opts, from_=1, to=20, width=5, textvariable=self.ai_limit_var).pack(side="left", padx=(6, 16))
+        ttk.Checkbutton(ai_opts, text="Let AI inspect listing photo", variable=self.ai_use_images_var).pack(side="left")
+
+        ttk.Label(
+            ai_frame,
+            text=(
+                "AI only runs on shortlisted new/changed listings. The API key is stored in Windows Credential Manager, "
+                "not config.json or GitHub. AI estimates can be wrong, so verify expensive purchases yourself."
+            ),
+            wraplength=930,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         searches_frame = ttk.LabelFrame(outer, text="Marketplace Searches", padding=10)
         searches_frame.pack(fill="both", expand=False, pady=8)
 
         columns = ("name", "max", "value", "discount", "score")
-        self.tree = ttk.Treeview(searches_frame, columns=columns, show="headings", height=8)
-        self.tree.heading("name", text="Name")
-        self.tree.heading("max", text="Max Price")
-        self.tree.heading("value", text="Price Baseline")
-        self.tree.heading("discount", text="Min Discount")
-        self.tree.heading("score", text="Min Score")
+        self.tree = ttk.Treeview(searches_frame, columns=columns, show="headings", height=7)
+        for key, label in [("name", "Name"), ("max", "Max Price"), ("value", "Price Baseline"), ("discount", "Min Discount"), ("score", "Rule Score")]:
+            self.tree.heading(key, text=label)
         self.tree.column("name", width=220)
         self.tree.column("max", width=100, anchor="center")
         self.tree.column("value", width=170, anchor="center")
         self.tree.column("discount", width=110, anchor="center")
         self.tree.column("score", width=90, anchor="center")
         self.tree.pack(side="left", fill="both", expand=True)
-
         scroll = ttk.Scrollbar(searches_frame, orient="vertical", command=self.tree.yview)
         scroll.pack(side="left", fill="y")
         self.tree.configure(yscrollcommand=scroll.set)
@@ -232,37 +251,29 @@ class App(tk.Tk):
 
         controls = ttk.Frame(outer)
         controls.pack(fill="x", pady=(4, 8))
-
-        self.save_btn = ttk.Button(controls, text="Save Settings", command=self.save_settings)
-        self.save_btn.pack(side="left")
-
+        ttk.Button(controls, text="Save Settings", command=self.save_settings).pack(side="left")
         self.once_btn = ttk.Button(controls, text="Run Once", command=lambda: self.start_watcher(True))
         self.once_btn.pack(side="left", padx=(8, 0))
-
         self.start_btn = ttk.Button(controls, text="Start Watcher", command=lambda: self.start_watcher(False))
         self.start_btn.pack(side="left", padx=(8, 0))
-
         self.stop_btn = ttk.Button(controls, text="Stop", command=self.stop_watcher, state="disabled")
         self.stop_btn.pack(side="left", padx=(8, 0))
-
         ttk.Button(controls, text="Clear Log", command=self.clear_log).pack(side="right")
 
         log_frame = ttk.LabelFrame(outer, text="Live Log", padding=8)
         log_frame.pack(fill="both", expand=True)
-
-        self.log_text = tk.Text(log_frame, height=14, wrap="word", state="disabled")
+        self.log_text = tk.Text(log_frame, height=12, wrap="word", state="disabled")
         self.log_text.pack(side="left", fill="both", expand=True)
         log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         log_scroll.pack(side="right", fill="y")
         self.log_text.configure(yscrollcommand=log_scroll.set)
 
-        self.log("Ready. Add a search, test Discord, then click Facebook Login.")
+        self.log("Ready. Add a Marketplace search, test Discord, and log into Facebook.")
 
     def log(self, message):
         self.log_queue.put(str(message))
 
     def drain_logs(self):
-        changed = False
         try:
             while True:
                 msg = self.log_queue.get_nowait()
@@ -270,14 +281,12 @@ class App(tk.Tk):
                 self.log_text.insert("end", msg + "\n")
                 self.log_text.see("end")
                 self.log_text.configure(state="disabled")
-                changed = True
         except queue.Empty:
             pass
 
         if self.worker_thread and not self.worker_thread.is_alive():
             self.worker_thread = None
             self.set_running(False)
-
         self.after(150, self.drain_logs)
 
     def clear_log(self):
@@ -285,14 +294,58 @@ class App(tk.Tk):
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
 
+    def refresh_ai_status(self):
+        self.ai_status_var.set("✅ API key saved" if ai_analyzer.has_api_key() else "⚠ No API key saved")
+
+    def save_ai_key(self):
+        try:
+            ai_analyzer.save_api_key(self.ai_key_var.get())
+            self.ai_key_var.set("")
+            self.refresh_ai_status()
+            self.log("OpenAI API key saved in Windows Credential Manager.")
+        except Exception as exc:
+            messagebox.showerror("AI API Key", str(exc))
+
+    def clear_ai_key(self):
+        if messagebox.askyesno("Clear API Key", "Remove the saved OpenAI API key from Windows Credential Manager?"):
+            try:
+                ai_analyzer.clear_api_key()
+                self.refresh_ai_status()
+                self.log("Saved OpenAI API key removed.")
+            except Exception as exc:
+                messagebox.showerror("AI API Key", str(exc))
+
+    def test_ai(self):
+        if self.ai_key_var.get().strip():
+            try:
+                ai_analyzer.save_api_key(self.ai_key_var.get())
+                self.ai_key_var.set("")
+                self.refresh_ai_status()
+            except Exception as exc:
+                messagebox.showerror("AI", str(exc))
+                return
+        if not ai_analyzer.has_api_key():
+            messagebox.showerror("AI", "Paste and save an OpenAI API key first.")
+            return
+
+        self.log("Testing OpenAI API...")
+        model = self.ai_model_var.get().strip() or "gpt-5-mini"
+
+        def worker():
+            try:
+                ai_analyzer.test_api_key(model)
+                self.log(f"OpenAI API test successful ✅ ({model})")
+            except Exception as exc:
+                self.log(f"OpenAI API test failed: {type(exc).__name__}: {exc}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def refresh_searches(self):
         for item in self.tree.get_children():
             self.tree.delete(item)
-
         for idx, search in enumerate(self.cfg.get("searches", [])):
             max_price = search.get("max_price")
             max_text = "Any" if max_price in (None, "") else f"${float(max_price):,.0f}"
-
             manual = search.get("estimated_value")
             if manual not in (None, ""):
                 value_text = f"${float(manual):,.0f} manual"
@@ -300,7 +353,6 @@ class App(tk.Tk):
                 value_text = "Automatic"
             else:
                 value_text = "None"
-
             self.tree.insert(
                 "",
                 "end",
@@ -316,9 +368,7 @@ class App(tk.Tk):
 
     def selected_index(self):
         selection = self.tree.selection()
-        if not selection:
-            return None
-        return int(selection[0])
+        return None if not selection else int(selection[0])
 
     def add_search(self):
         dialog = SearchDialog(self)
@@ -333,7 +383,6 @@ class App(tk.Tk):
         if idx is None:
             messagebox.showinfo("Edit Search", "Select a search first.")
             return
-
         dialog = SearchDialog(self, self.cfg["searches"][idx])
         self.wait_window(dialog)
         if dialog.result:
@@ -346,7 +395,6 @@ class App(tk.Tk):
         if idx is None:
             messagebox.showinfo("Remove Search", "Select a search first.")
             return
-
         name = self.cfg["searches"][idx].get("name", "this search")
         if messagebox.askyesno("Remove Search", f"Remove '{name}'?"):
             del self.cfg["searches"][idx]
@@ -356,14 +404,26 @@ class App(tk.Tk):
     def collect_settings(self):
         try:
             interval = max(15, int(self.interval_var.get().strip()))
+            ai_score = int(self.ai_score_var.get().strip())
+            ai_limit = int(self.ai_limit_var.get().strip())
         except ValueError:
-            raise ValueError("Check interval must be a number.")
+            raise ValueError("Interval, AI score, and AI checks must be whole numbers.")
+        if not 0 <= ai_score <= 100:
+            raise ValueError("AI score must be between 0 and 100.")
+        if not 1 <= ai_limit <= 20:
+            raise ValueError("AI checks per scan must be between 1 and 20.")
 
         self.cfg["discord_webhook_url"] = self.webhook_var.get().strip()
         self.cfg["check_interval_minutes"] = interval
         self.cfg["headless"] = bool(self.headless_var.get())
         self.cfg["alert_on_first_scan"] = bool(self.first_scan_var.get())
         self.cfg["alert_on_price_drop"] = bool(self.price_drop_var.get())
+        self.cfg["ai_enabled"] = bool(self.ai_enabled_var.get())
+        self.cfg["ai_model"] = self.ai_model_var.get().strip() or "gpt-5-mini"
+        self.cfg["ai_min_score"] = ai_score
+        self.cfg["ai_max_listings_per_scan"] = ai_limit
+        self.cfg["ai_use_images"] = bool(self.ai_use_images_var.get())
+        self.cfg.setdefault("ai_candidate_min_rule_score", 25)
         self.cfg.setdefault("max_alerts_per_scan", 5)
         self.cfg.setdefault("scroll_count", 4)
         self.cfg.setdefault("price_drop_percent", 10)
@@ -382,7 +442,6 @@ class App(tk.Tk):
         if not webhook:
             messagebox.showerror("Discord", "Paste your Discord webhook first.")
             return
-
         self.log("Testing Discord webhook...")
 
         def worker():
@@ -400,7 +459,6 @@ class App(tk.Tk):
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showinfo("Facebook Login", "Stop the watcher before opening the login browser.")
             return
-
         self.log("Starting Facebook login browser...")
 
         def worker():
@@ -421,32 +479,29 @@ class App(tk.Tk):
         if self.worker_thread and self.worker_thread.is_alive():
             messagebox.showinfo("Watcher", "Something is already running.")
             return
-
         try:
             self.collect_settings()
         except ValueError as exc:
             messagebox.showerror("Settings", str(exc))
             return
-
         if not self.cfg.get("searches"):
             messagebox.showerror("Watcher", "Add at least one Marketplace search.")
             return
+        if self.cfg.get("ai_enabled") and not ai_analyzer.has_api_key():
+            messagebox.showwarning(
+                "AI not configured",
+                "AI is enabled but no OpenAI API key is saved. The watcher will fall back to normal scoring.",
+            )
 
         watcher.save_config(self.cfg)
         self.stop_event = threading.Event()
         self.set_running(True)
         self.log("Starting one scan..." if once else "Watcher started.")
-
         cfg_copy = dict(self.cfg)
         cfg_copy["searches"] = [dict(s) for s in self.cfg["searches"]]
 
         def worker():
-            watcher.run_watcher(
-                cfg_copy,
-                log=self.log,
-                stop_event=self.stop_event,
-                once=once,
-            )
+            watcher.run_watcher(cfg_copy, log=self.log, stop_event=self.stop_event, once=once)
             self.log("Run finished." if once else "Watcher stopped.")
 
         self.worker_thread = threading.Thread(target=worker, daemon=True)
