@@ -1,5 +1,8 @@
 config.json
 marketplace_v2.db
+marketplace_v3.db
 browser_profile/
 .venv/
 __pycache__/
+.env
+*.pyc
