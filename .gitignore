@@ -1,0 +1,5 @@
+config.json
+marketplace_v2.db
+browser_profile/
+.venv/
+__pycache__/
